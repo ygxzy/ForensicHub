@@ -2,7 +2,6 @@ import importlib
 from collections.abc import Callable
 from collections import abc
 from typing import Dict, List, Optional, Type, Union, Any
-import inspect
 
 import difflib
 from rich.console import Console
@@ -28,7 +27,7 @@ class Registry:
         return len(self._module_dict)
 
     def __contains__(self, key):
-        return self.get(key) is not None
+        return self.has(key)
 
     def __repr__(self):
         table = Table(title=f'Registry of {self._name}')
@@ -138,7 +137,7 @@ class Registry:
 
         return _register
 
-    def build(self, name: dict, *args, **kwargs) -> Any:
+    def build(self, name: str, *args, **kwargs) -> Any:
         """Build an instance.
 
         Build an instance by calling :attr:`build_func`.
@@ -191,53 +190,76 @@ def register_evaluator(name: Optional[Union[str, List[str]]] = None, force: bool
     return EVALUATORS.register_module(name=name, force=force)
 
 
-def build_from_registry(registry, config_args):
-    # 从字典中获取 class 名称
-    name = config_args["name"]  # 直接从字典中访问
-    if name in registry.module_dict.keys():
-        cls = registry.get(name)
-    else:
-        cls = None
+def _coerce_config_value(value: Any) -> Any:
+    """Convert common config values from string to Python types."""
+    if isinstance(value, str):
+        v = value.strip()
+        if v.lower() == 'true':
+            return True
+        if v.lower() == 'false':
+            return False
+        if v.lower() in {'none', 'null'}:
+            return None
+    return value
 
-    # ========== 懒加载逻辑 ==========
+
+def _normalize_config(config: Any) -> Dict[str, Any]:
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise TypeError(f'init_config must be a dict, but got {type(config)}')
+
+    normalized = {}
+    for k, v in config.items():
+        if isinstance(v, dict):
+            normalized[k] = _normalize_config(v)
+        elif isinstance(v, list):
+            normalized[k] = [_coerce_config_value(item) for item in v]
+        else:
+            normalized[k] = _coerce_config_value(v)
+    return normalized
+
+
+def build_from_registry(registry, config_args):
+    """Build a registered class/function from a config dict.
+
+    This helper is intentionally robust against missing names, lazy imports,
+    and config values represented as strings.
+    """
+    if config_args is None or not isinstance(config_args, dict):
+        raise TypeError(f'config_args must be a dict, but got {type(config_args)}')
+
+    if 'name' not in config_args:
+        raise KeyError("config_args must contain a 'name' field specifying registry entry")
+
+    name = config_args['name']
+    cls = registry.get(name) if registry.has(name) else None
+
     if cls is None:
         from ForensicHub.lazy_maps import get_all_lazy_maps
-        ALL_LAZY_MODEL_MAP, ALL_LAZY_POSTFUNC_MAP = get_all_lazy_maps()
-        lazy_map = ALL_LAZY_MODEL_MAP if registry is MODELS else ALL_LAZY_POSTFUNC_MAP
-        module_path = lazy_map.get(name, None)
+
+        all_lazy_model_map, all_lazy_postfunc_map = get_all_lazy_maps()
+        lazy_map = all_lazy_model_map if registry is MODELS else all_lazy_postfunc_map
+        module_path = lazy_map.get(name, None) if lazy_map is not None else None
 
         if module_path is None:
             raise ValueError(f"Class or function '{name}' not found in registry or lazy map.")
 
         print(f"[lazy import] Loading '{name}' from '{module_path}'")
-        importlib.import_module(module_path)  # 动态加载
+        importlib.import_module(module_path)
 
-        # ========== Deepfake 包装逻辑 ==========
-        flag = True
         if registry is MODELS:
             from ForensicHub.lazy_maps import _wrap_deepfake_if_needed
             cls, flag = _wrap_deepfake_if_needed(cls, name)
-
-        if not flag: cls = registry.get(name)
+            if not flag:
+                cls = registry.get(name)
 
     if cls is None:
         raise ImportError(f"'{name}' was not registered after importing '{module_path}'")
 
-    # 获取 config 字典中的参数
-    if "init_config" in config_args:
-        config = config_args.get("init_config", {})  # 从字典中获取 config 部分
-    else:
-        config = {}
+    config = _normalize_config(config_args.get('init_config', {}))
 
-    # 处理额外的参数：比如如果参数是字符串 "true"，可以转化为布尔值
-    for k, v in config.items():
-        if isinstance(v, str):
-            if v.lower() == "true":
-                config[k] = True
-            elif v.lower() == "false":
-                config[k] = False
-
-    print(f"[build_from_registry] Creating model '{name}' with args: {config}")
+    print(f"[build_from_registry] Creating '{name}' with args: {config}")
     return cls(**config)
 
 
